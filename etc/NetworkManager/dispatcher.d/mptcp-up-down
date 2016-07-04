@@ -1,0 +1,171 @@
+#!/bin/bash
+
+local logfile
+local mptcp_allowed_devices
+
+
+logfile=/opt/mptcp-up-down.log
+
+mptcp_allowed_devices="ttyUSB*"
+
+
+plog() {
+ echo -e "$@" >> ${logfile}
+}
+
+exec_cmd() {
+    plog "/> '$@'"
+    eval $@ &>> ${logfile}
+#    plog "\n"
+}
+
+
+#
+# Use as:
+# if is_mptcp_allowed_device $DEVICE_IFACE; then
+# ...
+# fi
+is_mptcp_allowed_device() {
+
+    local devName
+
+    devName="$1"
+
+    for d in $mptcp_allowed_devices ; do
+	if [[ $devName == $d ]]; then
+	    return 0; # true
+	fi
+    done
+
+    return 1; # false
+}
+
+
+mptcp_enable_device() {
+    exec_cmd ip link set dev $DEVICE_IP_IFACE multipath on
+}
+
+
+mptcp_disable_device()
+{
+    exec_cmd ip link set dev $DEVICE_IP_IFACE multipath off
+    exec_cmd ip rule del table $DEVICE_IFACE
+    exec_cmd ip route flush table $DEVICE_IFACE
+}
+
+
+# Use as:  start_vpn_service <bind-address>
+start_vpn_service () {
+    if [[ "$(systemctl status myvpn@*.service)" == "" ]]; then
+	plog "STARTING VPN";
+	exec_cmd systemctl start myvpn@"$1".service      
+    fi
+}
+
+stop_vpn_service() {
+    plog "STOPPING VPN";
+    exec_cmd systemctl stop myvpn@*.service
+}
+
+
+has_active_mptcp_devices() {
+    
+    active_devs="($(nmcli -f DEVICE connection show --active))"
+
+    for d in $active_devs; do
+	if is_mptcp_allowed_device $d ; then
+	    return 0; # true
+	fi
+    done
+    return 1; # false
+}
+
+
+face="$1"
+event="$2"
+
+plog "\n\nNEW EVENT '$event' on '$face' at $(date): ARGS=$@"
+
+plog "ENV BEGIN:\n"
+env  >> ${logfile}
+plog "ENV END\n";
+
+
+if [[ "${DEVICE_IFACE}" == "" ]] ; then
+
+    plog "NO DEVICE_IFACE PROVIDED. IGNORE EVENT";
+
+elif ! is_mptcp_allowed_device "$DEVICE_IFACE"  ; then
+
+    mptcp_disable_device
+
+elif [[ "$event" == "down" ]]; then
+
+    mptcp_disable_device
+
+    
+elif [[ "$event" == "up" ]]; then
+
+    
+    plog "DEVICE $DEVICE_IFACE IS UP"
+
+    # Create a table-alias in /etc/iproute2/rt_tables
+    if fgrep -q "${DEVICE_IFACE}" /etc/iproute2/rt_tables ;  then
+	plog "NOTE: table-alias for ${DEVICE_IFACE}  already exists"
+    else 
+	NUM=`cat /etc/iproute2/rt_tables | wc -l`
+	echo "$NUM  ${DEVICE_IFACE}" >> /etc/iproute2/rt_tables
+	plog "Created table-alias for ${DEVICE_IFACE} NUM ${NUM}" 
+    fi
+
+    if [[ "${DHCP4_IP_ADDRESS}" != "" ]]; then
+	# DHCP4
+
+	SUBNET=`echo ${IP4_ADDRESS_0} | cut -d ' ' -f 1 | cut -d / -f 2`
+
+	if [[ "${DHCP4_NETWORK_NUMBER}" == "" ]]; then
+	    plog "UNEXPECTED ERROR: DHCP4_NETWORK_NUMBER NOT SET";
+	elif [[  "${SUBNET}" == "" ]] ; then
+	    plog "UNEXPECTED ERROR: FAILED TO PARSE SUBNET FROM IP4_ADDRESS_0";
+	elif [[  "${DHCP4_IP_ADDRESS}" == "" ]] ;then	    
+	    plog "UNEXPECTED ERROR: DHCP4_IP_ADDRESS NOT SET";	    
+	elif [[  "${DHCP4_ROUTERS}" == "" ]] ; then		 
+	    plog "UNEXPECTED ERROR: DHCP4_ROUTERS NOT SET";
+	elif [[ "${DEVICE_IP_IFACE}" == "" ]] ; then
+	    plog "UNEXPECTED ERROR: DEVICE_IP_IFACE NOT SET";
+        else		  
+            mptcp_enable_device
+	    exec_cmd ip route add table $DEVICE_IFACE to $DHCP4_NETWORK_NUMBER/$SUBNET dev $DEVICE_IP_IFACE scope link
+	    exec_cmd ip route add table $DEVICE_IFACE default via $DHCP4_ROUTERS dev $DEVICE_IP_IFACE
+	    exec_cmd ip rule add from $DHCP4_IP_ADDRESS table $DEVICE_IFACE
+	    start_vpn_service "$DHCP4_IP_ADDRESS"
+	fi
+    else
+	# PPP 
+	IPADDR=`echo ${IP4_ADDRESS_0} | cut -d ' ' -f 1 | cut -d / -f 1`
+
+	if [[ "${IPADDR}" == "" ]] ; then
+	    plog "UNEXPECTED ERROR: FAILED TO PARSE IPADDR FROM IP4_ADDRESS_0";
+	else 		
+            mptcp_enable_device
+	    exec_cmd ip route add table $DEVICE_IFACE default dev $DEVICE_IP_IFACE scope link
+	    exec_cmd ip rule add from $IPADDR table $DEVICE_IFACE
+	    start_vpn_service "$IPADDR"
+	fi
+	
+     fi    
+else
+    
+    ############################################
+    
+    plog "unexpected event $event" ;
+fi
+
+
+if ! has_active_mptcp_devices ; then
+  stop_vpn_service ;
+fi
+
+plog "END EVENT\n";
+
+
